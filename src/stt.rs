@@ -96,5 +96,9 @@ pub async fn stream(
     // Run both until WS closes.
     tokio::join!(send_loop, recv_loop);
 
+    // If Deepgram sent no final transcript (silence / very short clip), this
+    // empty event tells the TUI to exit Listening → Idle.
+    let _ = event_tx.send(AppEvent::TranscriptFinal(String::new()));
+
     Ok(())
 }

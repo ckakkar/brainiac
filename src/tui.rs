@@ -3,7 +3,7 @@ use std::io::{self, Stdout};
 
 use anyhow::Result;
 use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind},
+    event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -132,7 +132,7 @@ async fn run_app(
             Some(Ok(event)) = ct_events.next() => {
                 if let Event::Key(key) = event {
                     if key.kind != KeyEventKind::Release {
-                        handle_key(&mut state, key.code, &config, &event_tx, &mic, mic_sample_rate);
+                        handle_key(&mut state, key, &config, &event_tx, &mic, mic_sample_rate);
                     }
                 }
             }
@@ -143,8 +143,8 @@ async fn run_app(
             }
         }
 
-        // Exit on explicit quit
-        if state.status == Status::Idle && state.error.as_deref() == Some("__quit__") {
+        // Exit on explicit quit — works from any state.
+        if state.error.as_deref() == Some("__quit__") {
             break;
         }
     }
@@ -154,13 +154,19 @@ async fn run_app(
 
 fn handle_key(
     state: &mut AppState,
-    code: KeyCode,
+    key: KeyEvent,
     config: &Config,
     event_tx: &UnboundedSender<AppEvent>,
     mic: &Option<Microphone>,
     sample_rate: u32,
 ) {
-    match code {
+    // Ctrl+C always quits, regardless of state.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        state.error = Some("__quit__".into());
+        return;
+    }
+
+    match key.code {
         KeyCode::Char('q') | KeyCode::Esc => {
             state.error = Some("__quit__".into());
         }
@@ -193,7 +199,11 @@ fn handle_key(
 
                                 let api_key = config.deepgram_api_key.clone();
                                 let ev = event_tx.clone();
-                                tokio::spawn(crate::stt::stream(api_key, sample_rate, audio_rx, ev));
+                                tokio::spawn(async move {
+                                    if let Err(e) = crate::stt::stream(api_key, sample_rate, audio_rx, ev.clone()).await {
+                                        let _ = ev.send(AppEvent::Error(format!("STT: {e}")));
+                                    }
+                                });
                             }
                             Err(e) => state.error = Some(format!("Mic error: {e}")),
                         }
@@ -238,7 +248,10 @@ fn handle_app_event(
         AppEvent::TranscriptFinal(t) => {
             state.current_transcript.clear();
             if t.is_empty() {
-                state.status = Status::Idle;
+                // Only reset if we're still waiting — don't clobber Thinking/Speaking.
+                if state.status == Status::Listening {
+                    state.status = Status::Idle;
+                }
                 return;
             }
             state.conversation.push(Message::User(t.clone()));
@@ -248,7 +261,11 @@ fn handle_app_event(
             let cfg = config.clone();
             let history = state.conversation.clone();
             let ev = event_tx.clone();
-            tokio::spawn(crate::llm::complete(cfg, history, ev));
+            tokio::spawn(async move {
+                if let Err(e) = crate::llm::complete(cfg, history, ev.clone()).await {
+                    let _ = ev.send(AppEvent::Error(format!("LLM: {e}")));
+                }
+            });
         }
 
         AppEvent::LlmToken(token) => {
@@ -266,7 +283,11 @@ fn handle_app_event(
 
             let cfg = config.clone();
             let ev = event_tx.clone();
-            tokio::spawn(crate::tts::speak(cfg, response, ev));
+            tokio::spawn(async move {
+                if let Err(e) = crate::tts::speak(cfg, response, ev.clone()).await {
+                    let _ = ev.send(AppEvent::Error(format!("TTS: {e}")));
+                }
+            });
         }
 
         AppEvent::TtsComplete => {

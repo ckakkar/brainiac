@@ -1,6 +1,6 @@
 # Brainiac
 
-A voice-activated AI assistant that runs in your terminal. Press Space to speak, get a spoken response back. No GUI, no browser — just a TUI and your mic.
+A voice-activated AI assistant that runs in your terminal. Press Space to speak, get a spoken response back. No GUI, no browser — just your terminal and your mic. It ships with two front-ends over one pipeline: a full-screen TUI (default) and a minimal line-based mode (`--minimal`).
 
 ```
   ◈ BRAINIAC v0.1                                     ◉ LISTENING
@@ -22,6 +22,8 @@ A voice-activated AI assistant that runs in your terminal. Press Space to speak,
   [SPACE/ENTER] push-to-talk   [C] clear   [↑↓] scroll   [Q/ESC] quit
 ```
 
+*Above: the default TUI. Run with `--minimal` for the same conversation as plain scrolling text — no boxes, no alternate screen.*
+
 ## What it does
 
 Brainiac is a real-time voice ↔ AI pipeline:
@@ -30,14 +32,16 @@ Brainiac is a real-time voice ↔ AI pipeline:
 2. **STT** — streams raw PCM to [Deepgram](https://deepgram.com) over a WebSocket, receiving partial and final transcripts in real time
 3. **LLM** — sends the completed transcript plus conversation history to [DeepSeek](https://www.deepseek.com) and streams tokens back as they arrive
 4. **TTS** — sends the full response to [Deepgram Aura](https://deepgram.com/product/text-to-speech) and plays the returned audio through your speakers via [rodio](https://github.com/RustAudio/rodio)
-5. **TUI** — a [Ratatui](https://ratatui.rs) terminal UI shows the live waveform, partial transcript, streaming response, and conversation history
+5. **UI** — the default front-end is a [Ratatui](https://ratatui.rs) TUI showing the live waveform, partial transcript, streaming response, and conversation history. Pass `--minimal` to swap it for a plain line-based UI over the same pipeline.
 
 The interaction is toggle-based: one Space press to start recording, another to stop. Deepgram flushes its final transcript after you stop, so you don't need to hold a key.
 
 ## Architecture
 
+Both front-ends drive the same back-end pipeline:
+
 ```
-[SPACE] → mic thread (cpal)
+[start] → mic thread (cpal)
         → audio channel (tokio unbounded)
         → stt::stream task (Deepgram WebSocket)
         → TranscriptFinal event
@@ -51,7 +55,7 @@ The interaction is toggle-based: one Space press to start recording, another to 
 
 A few design constraints worth knowing:
 
-- **Mic on a dedicated OS thread** — `cpal::Stream` is `!Send` on macOS CoreAudio. The thread owns the stream; the TUI sends start/stop commands over `std::sync::mpsc`. No `unsafe impl Send`.
+- **Mic on a dedicated OS thread** — `cpal::Stream` is `!Send` on macOS CoreAudio. The thread owns the stream; the front-end sends start/stop commands over `std::sync::mpsc`. No `unsafe impl Send`.
 - **Audio channel as lifecycle signal** — dropping the `UnboundedSender` on stop propagates as `None` to the STT task, which sends a WebSocket Close and waits for Deepgram's final transcript before exiting. Clean shutdown without cancellation tokens.
 - **TTS on its own thread** — `rodio::OutputStream` is `!Send`. A `tokio::sync::oneshot` bridges playback completion back to the async runtime.
 
@@ -107,9 +111,19 @@ The first time you run Brainiac, macOS will prompt for microphone access. Grant 
 cargo run --release
 # or after build:
 ./target/release/brainiac
+
+# minimal line-based UI instead of the full TUI:
+./target/release/brainiac --minimal   # or -m
 ```
 
 ## Usage
+
+Brainiac has two interchangeable front-ends over the same mic → STT → LLM → TTS pipeline:
+
+- **Default** — a full-screen [Ratatui](https://ratatui.rs) TUI driven by single keypresses (waveform, live transcript, scrollable history).
+- **`--minimal` / `-m`** — a plain, line-based terminal UI driven by typed commands + `Enter`. No alternate screen or raw mode, so it plays nicely with SSH sessions, tmux scrollback, and copy-pasting the transcript.
+
+**Default TUI** — single keypresses:
 
 | Key | Action |
 |---|---|
@@ -128,6 +142,14 @@ cargo run --release
 6. Returns to **IDLE** — ready for the next turn
 
 Conversation history is preserved across turns so you can ask follow-up questions naturally. Press `C` to start a fresh session.
+
+**Minimal mode (`--minimal`)** — type a command and press `Enter`:
+
+| Input | Action |
+|---|---|
+| `Enter` (empty line) | Start recording; press `Enter` again to stop and send |
+| `c` / `clear` | Clear conversation history |
+| `q` / `quit` / `exit` | Quit |
 
 ## Configuration
 
@@ -152,7 +174,7 @@ Since `DEEPSEEK_BASE_URL` is configurable, you can point Brainiac at any OpenAI-
 | `rodio` | Audio playback |
 | `tokio-tungstenite` | WebSocket for Deepgram STT |
 | `reqwest` | HTTP for DeepSeek SSE and Deepgram TTS |
-| `ratatui` + `crossterm` | Terminal UI |
+| `ratatui` + `crossterm` | Default TUI front-end |
 | `serde` / `serde_json` | JSON serialization |
 | `dotenvy` | `.env` file loading |
 | `anyhow` | Error handling |
@@ -161,12 +183,13 @@ Since `DEEPSEEK_BASE_URL` is configurable, you can point Brainiac at any OpenAI-
 
 ```
 src/
-├── main.rs      — entry point; loads config and starts TUI
+├── main.rs      — entry point; parses `--minimal`, loads config, starts the chosen front-end
 ├── config.rs    — reads env vars into Config struct
 ├── events.rs    — AppEvent enum (the message bus between all layers)
 ├── audio.rs     — cpal mic management on a dedicated OS thread
 ├── stt.rs       — Deepgram WebSocket streaming
 ├── llm.rs       — DeepSeek SSE streaming + system prompt
 ├── tts.rs       — Deepgram Aura HTTP + rodio playback thread
-└── tui.rs       — Ratatui render loop + state machine
+├── tui.rs       — Ratatui render loop + state machine (default front-end)
+└── terminal.rs  — minimal line-based front-end (`--minimal`)
 ```
